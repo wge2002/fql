@@ -171,6 +171,8 @@ def main(_):
 
             if config['agent_name'] == 'rebrac':
                 agent, update_info = agent.update(batch, full_update=(i % config['actor_freq'] == 0))
+            elif config['agent_name'] == 'fql':
+                agent, update_info = agent.update(batch, skip_bc_distill=config['skip_online_bc_distill'])
             else:
                 agent, update_info = agent.update(batch)
 

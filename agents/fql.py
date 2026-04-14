@@ -1,4 +1,5 @@
 import copy
+from functools import partial
 from typing import Any
 
 import flax
@@ -43,27 +44,31 @@ class FQLAgent(flax.struct.PyTreeNode):
             'q_min': q.min(),
         }
 
-    def actor_loss(self, batch, grad_params, rng):
+    def actor_loss(self, batch, grad_params, rng, skip_bc_distill=False):
         """Compute the FQL actor loss."""
         batch_size, action_dim = batch['actions'].shape
-        rng, x_rng, t_rng = jax.random.split(rng, 3)
+        x_rng, t_rng, noise_rng, action_rng = jax.random.split(rng, 4)
 
-        # BC flow loss.
-        x_0 = jax.random.normal(x_rng, (batch_size, action_dim))
-        x_1 = batch['actions']
-        t = jax.random.uniform(t_rng, (batch_size, 1))
-        x_t = (1 - t) * x_0 + t * x_1
-        vel = x_1 - x_0
-
-        pred = self.network.select('actor_bc_flow')(batch['observations'], x_t, t, params=grad_params)
-        bc_flow_loss = jnp.mean((pred - vel) ** 2)
-
-        # Distillation loss.
-        rng, noise_rng = jax.random.split(rng)
         noises = jax.random.normal(noise_rng, (batch_size, action_dim))
-        target_flow_actions = self.compute_flow_actions(batch['observations'], noises=noises)
         actor_actions = self.network.select('actor_onestep_flow')(batch['observations'], noises, params=grad_params)
-        distill_loss = jnp.mean((actor_actions - target_flow_actions) ** 2)
+
+        if skip_bc_distill:
+            bc_flow_loss = jnp.zeros((), dtype=actor_actions.dtype)
+            distill_loss = jnp.zeros((), dtype=actor_actions.dtype)
+        else:
+            # BC flow loss.
+            x_0 = jax.random.normal(x_rng, (batch_size, action_dim))
+            x_1 = batch['actions']
+            t = jax.random.uniform(t_rng, (batch_size, 1))
+            x_t = (1 - t) * x_0 + t * x_1
+            vel = x_1 - x_0
+
+            pred = self.network.select('actor_bc_flow')(batch['observations'], x_t, t, params=grad_params)
+            bc_flow_loss = jnp.mean((pred - vel) ** 2)
+
+            # Distillation loss.
+            target_flow_actions = self.compute_flow_actions(batch['observations'], noises=noises)
+            distill_loss = jnp.mean((actor_actions - target_flow_actions) ** 2)
 
         # Q loss.
         actor_actions = jnp.clip(actor_actions, -1, 1)
@@ -79,20 +84,21 @@ class FQLAgent(flax.struct.PyTreeNode):
         actor_loss = bc_flow_loss + self.config['alpha'] * distill_loss + q_loss
 
         # Additional metrics for logging.
-        actions = self.sample_actions(batch['observations'], seed=rng)
+        actions = self.sample_actions(batch['observations'], seed=action_rng)
         mse = jnp.mean((actions - batch['actions']) ** 2)
 
         return actor_loss, {
             'actor_loss': actor_loss,
             'bc_flow_loss': bc_flow_loss,
             'distill_loss': distill_loss,
+            'bc_distill_skipped': jnp.array(skip_bc_distill, dtype=jnp.float32),
             'q_loss': q_loss,
             'q': q.mean(),
             'mse': mse,
         }
 
-    @jax.jit
-    def total_loss(self, batch, grad_params, rng=None):
+    @partial(jax.jit, static_argnames=('skip_bc_distill',))
+    def total_loss(self, batch, grad_params, rng=None, skip_bc_distill=False):
         """Compute the total loss."""
         info = {}
         rng = rng if rng is not None else self.rng
@@ -103,7 +109,7 @@ class FQLAgent(flax.struct.PyTreeNode):
         for k, v in critic_info.items():
             info[f'critic/{k}'] = v
 
-        actor_loss, actor_info = self.actor_loss(batch, grad_params, actor_rng)
+        actor_loss, actor_info = self.actor_loss(batch, grad_params, actor_rng, skip_bc_distill=skip_bc_distill)
         for k, v in actor_info.items():
             info[f'actor/{k}'] = v
 
@@ -119,13 +125,13 @@ class FQLAgent(flax.struct.PyTreeNode):
         )
         network.params[f'modules_target_{module_name}'] = new_target_params
 
-    @jax.jit
-    def update(self, batch):
+    @partial(jax.jit, static_argnames=('skip_bc_distill',))
+    def update(self, batch, skip_bc_distill=False):
         """Update the agent and return a new agent with information dictionary."""
         new_rng, rng = jax.random.split(self.rng)
 
         def loss_fn(grad_params):
-            return self.total_loss(batch, grad_params, rng=rng)
+            return self.total_loss(batch, grad_params, rng=rng, skip_bc_distill=skip_bc_distill)
 
         new_network, info = self.network.apply_loss_fn(loss_fn=loss_fn)
         self.target_update(new_network, 'critic')
@@ -264,6 +270,7 @@ def get_config():
             alpha=10.0,  # BC coefficient (need to be tuned for each environment).
             flow_steps=10,  # Number of flow steps.
             normalize_q_loss=False,  # Whether to normalize the Q loss.
+            skip_online_bc_distill=False,  # Whether to skip BC flow and distillation losses during online fine-tuning.
             encoder=ml_collections.config_dict.placeholder(str),  # Visual encoder name (None, 'impala_small', etc.).
         )
     )
